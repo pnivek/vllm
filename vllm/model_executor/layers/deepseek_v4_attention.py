@@ -1475,7 +1475,14 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             fields=decode_fields,
         )
 
-        if is_b12x_mla_enabled(q.device):
+        # Skip b12x during CUDA graph capture: any Python-level exception in our
+        # dispatch corrupts the recording stream (cudaErrorStreamCaptureInvalidated)
+        # and the Triton fallback below cannot recover from it.  Capture happens
+        # only during warmup; steady-state decode is unaffected.
+        if (
+            is_b12x_mla_enabled(q.device)
+            and not torch.cuda.is_current_stream_capturing()
+        ):
             try:
                 self._forward_sparse_mla_decode_b12x(
                     q=q,
