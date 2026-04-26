@@ -19,6 +19,7 @@ _TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH_ENV = (
 )
 _TRITON_MLA_SPARSE_HEAD_BLOCK_ENV = "VLLM_TRITON_MLA_SPARSE_HEAD_BLOCK_SIZE"
 _TRITON_MLA_SPARSE_MATMUL_DECODE_ENV = "VLLM_TRITON_MLA_SPARSE_MATMUL_DECODE"
+_B12X_MLA_ENV = "VLLM_B12X_MLA"
 
 _ENV_TRUE_VALUES = {"1", "true", "yes", "on"}
 _ENV_FALSE_VALUES = {"0", "false", "no", "off"}
@@ -164,3 +165,46 @@ def sparse_mla_matmul_decode_enabled() -> bool:
     if configured is not None:
         return configured
     return current_platform.is_device_capability_family(120)
+
+
+def is_b12x_mla_enabled(device: torch.device | None = None) -> bool:
+    """True iff b12x sparse MLA acceleration should be used on `device`.
+
+    Gated by:
+      - VLLM_B12X_MLA env var (1/0 explicit override)
+      - b12x importable in the current process
+      - SM120 / SM121 device capability (b12x kernels are SM12x-only)
+    """
+    configured = _optional_env_flag(_B12X_MLA_ENV)
+    if configured is False:
+        return False
+
+    try:
+        import b12x  # noqa: F401
+    except Exception:
+        if configured is True:
+            logger.warning_once(
+                "VLLM_B12X_MLA=1 but `import b12x` failed; falling back to "
+                "Triton sparse MLA path."
+            )
+        return False
+
+    if device is None:
+        if not torch.cuda.is_available():
+            return False
+        device = torch.device("cuda", torch.cuda.current_device())
+    if device.type != "cuda":
+        return False
+    cap_major, cap_minor = torch.cuda.get_device_capability(device.index)
+    if cap_major != 12 or cap_minor not in (0, 1):
+        if configured is True:
+            logger.warning_once(
+                f"VLLM_B12X_MLA=1 but device sm_{cap_major}{cap_minor} is not "
+                "supported by b12x (requires sm_120 or sm_121)."
+            )
+        return False
+
+    if configured is True:
+        return True
+    # Default: opt-in only — b12x is not enabled unless the env var is set.
+    return False
