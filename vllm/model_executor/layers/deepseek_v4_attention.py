@@ -1132,12 +1132,16 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         device = q.device
 
         # 1. Build the global slot id table (combined SWA + topk for compressed).
-        swa_indices = swa_metadata.decode_swa_indices[:num_decode_tokens].to(
-            torch.int32
-        )
-        swa_lens = swa_metadata.decode_swa_lens[:num_decode_tokens].to(
-            torch.int32
-        )
+        swa_indices_raw = swa_metadata.decode_swa_indices[:num_decode_tokens]
+        # vLLM hands us swa_indices as (N, 1, max_swa_len) with a dummy middle
+        # dim; b12x expects rank-2 (N, max_swa_len).
+        if swa_indices_raw.ndim == 3 and swa_indices_raw.shape[1] == 1:
+            swa_indices_raw = swa_indices_raw.squeeze(1)
+        swa_indices = swa_indices_raw.to(torch.int32).contiguous()
+        swa_lens_raw = swa_metadata.decode_swa_lens[:num_decode_tokens]
+        if swa_lens_raw.ndim == 2 and swa_lens_raw.shape[1] == 1:
+            swa_lens_raw = swa_lens_raw.squeeze(1)
+        swa_lens = swa_lens_raw.to(torch.int32).contiguous()
         if swa_only:
             assert compressed_k_cache is None or compressed_k_cache.numel() == 0
             page_table_full = swa_indices  # (N, max_swa_len) int32
