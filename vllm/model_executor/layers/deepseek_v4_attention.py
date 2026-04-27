@@ -1201,6 +1201,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         )
 
         # 6. Write back into the FlashMLA-padded output buffer.
+        logger.info_once("b12x sparse MLA decode dispatch invoked successfully (b12x_dispatch_invoked)")
         output[:num_decode_tokens, :self.num_heads, :self.kv_lora_rank].copy_(
             output_b12x
         )
