@@ -71,6 +71,7 @@ from vllm.v1.attention.backends.mla.indexer import (
 from vllm.v1.attention.backends.mla.sparse_mla_env import (
     disable_sparse_mla_reference_cudagraphs_if_enabled,
     is_sparse_mla_attention_dump_enabled,
+    is_b12x_mla_enabled,
     is_sparse_mla_reference_attention_enabled,
     sparse_mla_attention_dump_path,
     sparse_mla_matmul_decode_enabled,
@@ -850,28 +851,62 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
     ) -> None:
         num_decodes = swa_metadata.num_decodes
         num_decode_tokens = swa_metadata.num_decode_tokens
-        assert num_decodes == num_decode_tokens, (
-            "Sparse MLA reference SWA decode currently supports one query token per "
-            f"request, got {num_decode_tokens=} and {num_decodes=}"
-        )
+        mtp_decode = num_decode_tokens != num_decodes
 
         swa_lens = swa_metadata.decode_swa_lens[:num_decode_tokens]
+        swa_indices = swa_metadata.decode_swa_indices[:num_decode_tokens]
         max_swa_len = swa_metadata.decode_swa_indices.shape[-1]
         head_block_size = sparse_mla_decode_head_block_size(num_decode_tokens)
-        fp8ds_paged_sparse_mla_attention_with_sink_multihead(
+        if not mtp_decode:
+            fp8ds_paged_sparse_mla_attention_with_sink_multihead(
+                q=q,
+                k_cache=swa_k_cache,
+                seq_lens=swa_metadata.seq_lens[:num_decodes],
+                gather_lens=swa_lens,
+                block_table=swa_metadata.block_table[:num_decodes],
+                block_size=swa_metadata.block_size,
+                candidate_offset=0,
+                num_candidates=max_swa_len,
+                scale=self.scale,
+                attn_sink=self.attn_sink,
+                output=output,
+                head_block_size=head_block_size,
+                num_heads=self.num_heads,
+            )
+            if output.shape[1] > self.num_heads:
+                output[:, self.num_heads :].zero_()
+            return
+
+        (
+            swa_max_score,
+            swa_denom,
+            swa_acc,
+        ) = current_workspace_manager().get_simultaneous(
+            ((num_decode_tokens, self.num_heads), torch.float32),
+            ((num_decode_tokens, self.num_heads), torch.float32),
+            ((num_decode_tokens, self.num_heads, q.shape[-1]), torch.float32),
+        )
+        swa_max_score.fill_(float("-inf"))
+        swa_denom.zero_()
+        swa_acc.zero_()
+        accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead(
             q=q,
             k_cache=swa_k_cache,
-            seq_lens=swa_metadata.seq_lens[:num_decodes],
-            gather_lens=swa_lens,
-            block_table=swa_metadata.block_table[:num_decodes],
+            slot_ids=swa_indices,
+            lens=swa_lens,
             block_size=swa_metadata.block_size,
-            candidate_offset=0,
-            num_candidates=max_swa_len,
             scale=self.scale,
-            attn_sink=self.attn_sink,
-            output=output,
+            max_score=swa_max_score,
+            denom=swa_denom,
+            acc=swa_acc,
             head_block_size=head_block_size,
-            num_heads=self.num_heads,
+        )
+        finish_sparse_mla_attention_with_sink(
+            swa_max_score,
+            swa_denom,
+            swa_acc,
+            self.attn_sink,
+            output=output,
         )
         if output.shape[1] > self.num_heads:
             output[:, self.num_heads :].zero_()
@@ -895,10 +930,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
 
         num_decodes = swa_metadata.num_decodes
         num_decode_tokens = swa_metadata.num_decode_tokens
-        assert num_decodes == num_decode_tokens, (
-            "Sparse MLA reference compressed decode currently supports one query "
-            f"token per request, got {num_decode_tokens=} and {num_decodes=}"
-        )
+        mtp_decode = num_decode_tokens != num_decodes
 
         max_swa_len = swa_metadata.decode_swa_indices.shape[-1]
         compressed_block_size = attn_metadata.block_size // self.compress_ratio
@@ -909,9 +941,11 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         )
         compressed_slot_ids = topk_indices[:, 0, :]
         swa_lens = swa_metadata.decode_swa_lens[:num_decode_tokens]
+        swa_indices = swa_metadata.decode_swa_indices[:num_decode_tokens]
         head_block_size = sparse_mla_decode_head_block_size(num_decode_tokens)
         if (
-            compressed_topk <= topk_chunk_size
+            not mtp_decode
+            and compressed_topk <= topk_chunk_size
             and sparse_mla_matmul_decode_enabled()
         ):
             total_candidates = compressed_topk + max_swa_len
@@ -954,7 +988,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             )
             return
 
-        if compressed_topk <= topk_chunk_size:
+        if not mtp_decode and compressed_topk <= topk_chunk_size:
             fp8ds_global_paged_sparse_mla_attention_with_sink_multihead(
                 q=q,
                 compressed_k_cache=compressed_k_cache,
@@ -1015,21 +1049,35 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 acc=comp_acc,
                 head_block_size=head_block_size,
             )
-        accumulate_fp8ds_paged_sparse_mla_attention_chunk_multihead(
-            q=q,
-            k_cache=swa_k_cache,
-            seq_lens=swa_metadata.seq_lens[:num_decodes],
-            gather_lens=swa_lens,
-            block_table=swa_metadata.block_table[:num_decodes],
-            block_size=swa_metadata.block_size,
-            candidate_offset=0,
-            num_candidates=max_swa_len,
-            scale=self.scale,
-            max_score=swa_max_score,
-            denom=swa_denom,
-            acc=swa_acc,
-            head_block_size=head_block_size,
-        )
+        if mtp_decode:
+            accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead(
+                q=q,
+                k_cache=swa_k_cache,
+                slot_ids=swa_indices,
+                lens=swa_lens,
+                block_size=swa_metadata.block_size,
+                scale=self.scale,
+                max_score=swa_max_score,
+                denom=swa_denom,
+                acc=swa_acc,
+                head_block_size=head_block_size,
+            )
+        else:
+            accumulate_fp8ds_paged_sparse_mla_attention_chunk_multihead(
+                q=q,
+                k_cache=swa_k_cache,
+                seq_lens=swa_metadata.seq_lens[:num_decodes],
+                gather_lens=swa_lens,
+                block_table=swa_metadata.block_table[:num_decodes],
+                block_size=swa_metadata.block_size,
+                candidate_offset=0,
+                num_candidates=max_swa_len,
+                scale=self.scale,
+                max_score=swa_max_score,
+                denom=swa_denom,
+                acc=swa_acc,
+                head_block_size=head_block_size,
+            )
         finish_two_sparse_mla_attention_states_with_sink(
             comp_max_score,
             comp_denom,
@@ -1042,6 +1090,185 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         )
         if output.shape[1] > self.num_heads:
             output[:, self.num_heads :].zero_()
+
+    def _forward_sparse_mla_decode_b12x(
+        self,
+        *,
+        q: torch.Tensor,
+        swa_k_cache: torch.Tensor,
+        compressed_k_cache: torch.Tensor | None,
+        topk_indices: torch.Tensor | None,
+        topk_lens: torch.Tensor | None,
+        swa_metadata: "DeepseekSparseSWAMetadata",
+        attn_metadata: "FlashMLASparseMetadata | None",
+        swa_only: bool,
+        output: torch.Tensor,
+    ) -> None:
+        """Decode via b12x sparse_mla_decode_forward.
+
+        Replaces the Triton/FlashMLA path for SM12x decode.  Handles SWA-only
+        and compressed (C4A/C128A) cases by combining their gather indices.
+
+        Limitations (v1):
+          - Sink correction not yet wired through b12x; relies on DSV4-Flash's
+            sink being -inf padded (so contribution is zero).
+          - KV cache is per-call gather-converted (Option A from spec); fused
+            insert is a future optimization.
+        """
+        from b12x.integration.mla import (
+            B12XAttentionArena,
+            B12XAttentionArenaCaps,
+            B12XAttentionWorkspaceContract,
+            MLASparseDecodeMetadata,
+            sparse_mla_decode_forward,
+        )
+        from b12x.integration.vllm_kv_converter import (
+            convert_fp8ds_to_b12x_gathered,
+        )
+
+        num_decodes = swa_metadata.num_decodes
+        num_decode_tokens = swa_metadata.num_decode_tokens
+        block_size = int(swa_metadata.block_size)
+        device = q.device
+
+        # 1. Build the global slot id table (combined SWA + topk for compressed).
+        swa_indices_raw = swa_metadata.decode_swa_indices[:num_decode_tokens]
+        # vLLM hands us swa_indices as (N, 1, max_swa_len) with a dummy middle
+        # dim; b12x expects rank-2 (N, max_swa_len).
+        if swa_indices_raw.ndim == 3 and swa_indices_raw.shape[1] == 1:
+            swa_indices_raw = swa_indices_raw.squeeze(1)
+        swa_indices = swa_indices_raw.to(torch.int32).contiguous()
+        swa_lens_raw = swa_metadata.decode_swa_lens[:num_decode_tokens]
+        if swa_lens_raw.ndim == 2 and swa_lens_raw.shape[1] == 1:
+            swa_lens_raw = swa_lens_raw.squeeze(1)
+        swa_lens = swa_lens_raw.to(torch.int32).contiguous()
+        if swa_only:
+            assert compressed_k_cache is None or compressed_k_cache.numel() == 0
+            page_table_full = swa_indices  # (N, max_swa_len) int32
+            active_lens = swa_lens
+            # gather only from swa cache
+            kv_for_convert = swa_k_cache
+        else:
+            if compressed_k_cache is None or topk_indices is None or topk_lens is None:
+                raise RuntimeError(
+                    "compressed b12x decode requires topk_indices, topk_lens, "
+                    "and compressed_k_cache"
+                )
+            # topk_indices is (N, 1, max_topk) — squeeze the dummy dim.
+            topk_2d = topk_indices.view(num_decode_tokens, -1).to(torch.int32)
+            page_table_full = torch.cat([topk_2d, swa_indices], dim=1)
+            active_lens = (topk_lens.to(torch.int32) +
+                           swa_lens.to(torch.int32))
+            # NOTE: combining two backing caches into one b12x cache requires
+            # us to materialise their gather sources separately and stitch the
+            # indices.  For v1 we only support swa_only; compressed comes next.
+            raise NotImplementedError(
+                "b12x compressed (C4A/C128A) dispatch not yet implemented; "
+                "set VLLM_B12X_MLA=0 or rely on the Triton fallback for now"
+            )
+
+        # 2. Convert vLLM fp8_ds_mla cache rows (gather-first) -> b12x packed.
+        b12x_cache, new_page_table = convert_fp8ds_to_b12x_gathered(
+            kv_for_convert, page_table_full, block_size=block_size,
+        )
+        topk = int(new_page_table.shape[1])
+
+        # 3. Allocate (or reuse) b12x workspace.
+        ws = self._b12x_workspace_for(num_decode_tokens, num_decodes, topk,
+                                      device, b12x_cache.shape[0])
+
+        # 4. Slice q from padded_heads -> num_heads (drop FlashMLA padding).
+        q_b12x = q.view(num_decode_tokens, q.shape[-2], q.shape[-1])
+        q_b12x = q_b12x[:, :self.num_heads, :].contiguous()
+
+        # 5. Build metadata + run b12x decode.
+        cache_seqlens_int32 = active_lens.clone()
+        nsa_cache_seqlens_int32 = active_lens.clone()
+        max_seq_len_k = int(active_lens.max().item()) if active_lens.numel() else 0
+        metadata = MLASparseDecodeMetadata(
+            page_table_1=new_page_table,
+            cache_seqlens_int32=cache_seqlens_int32,
+            nsa_cache_seqlens_int32=nsa_cache_seqlens_int32,
+            max_seq_len_k=max_seq_len_k,
+        )
+        output_b12x = sparse_mla_decode_forward(
+            q_all=q_b12x,
+            kv_cache=b12x_cache,
+            metadata=metadata,
+            workspace=ws,
+            sm_scale=float(self.scale),
+            v_head_dim=int(self.kv_lora_rank),
+        )
+
+        # 6. Write back into the FlashMLA-padded output buffer.
+        output[:num_decode_tokens, :self.num_heads, :self.kv_lora_rank].copy_(
+            output_b12x
+        )
+        if output.shape[1] > self.num_heads:
+            output[:num_decode_tokens, self.num_heads:].zero_()
+
+    def _b12x_workspace_for(
+        self,
+        max_total_q: int,
+        max_batch: int,
+        topk: int,
+        device: torch.device,
+        max_kv_rows: int,
+    ):
+        """Lazy-cached b12x workspace keyed on shape signature."""
+        from b12x.integration.mla import (
+            B12XAttentionArena,
+            B12XAttentionArenaCaps,
+            B12XAttentionWorkspaceContract,
+        )
+
+        cache = getattr(self, "_b12x_workspaces", None)
+        if cache is None:
+            cache = {}
+            self._b12x_workspaces = cache
+        # round capacity upwards so we don't churn on minor batch deltas
+        bucket_q = max(8, 1 << (max_total_q - 1).bit_length()) if max_total_q else 8
+        bucket_kv = max(64, 1 << (max_kv_rows - 1).bit_length()) if max_kv_rows else 64
+        bucket_topk = max(64, 1 << (topk - 1).bit_length()) if topk else 64
+        key = (bucket_q, max_batch, bucket_topk, bucket_kv,
+               int(self.num_heads), int(self.head_dim), int(self.kv_lora_rank),
+               int(getattr(self.swa_cache_layer.kv_cache, "shape", [0, 0])[0]))
+        ws = cache.get(key)
+        if ws is not None:
+            return ws
+
+        caps = B12XAttentionArenaCaps(
+            device=device,
+            dtype=torch.bfloat16,
+            kv_dtype=torch.uint8,
+            num_q_heads=int(self.num_heads),
+            indexer_num_q_heads=int(self.num_heads),
+            head_dim=int(self.head_dim),
+            max_v_head_dim=int(self.kv_lora_rank),
+            topk=bucket_topk,
+            max_page_table_width=bucket_topk,
+            extend_max_total_q=bucket_q,
+            extend_max_batch=max_batch,
+            extend_max_kv_rows=bucket_kv,
+            paged_max_q_rows=bucket_q,
+            paged_max_batch=max_batch,
+            page_size=int(self.swa_cache_layer.kv_cache.shape[1])
+            if self.swa_cache_layer.kv_cache.ndim > 1 else 256,
+            padded_heads=int(self.num_heads),
+        )
+        arena = B12XAttentionArena.allocate(caps)
+        ws = arena.make_workspace(B12XAttentionWorkspaceContract(
+            mode="decode",
+            max_total_q=bucket_q,
+            max_batch=max_batch,
+            max_paged_q_rows=bucket_q,
+            max_kv_rows=bucket_kv,
+            v_head_dim=int(self.kv_lora_rank),
+            indexer_num_q_heads=int(self.num_heads),
+            max_page_table_width=bucket_topk,
+        ))
+        cache[key] = ws
+        return ws
 
     def _forward_sparse_mla_prefill_reference(
         self,
@@ -1247,6 +1474,34 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             attn_metadata=attn_metadata,
             fields=decode_fields,
         )
+
+        # Skip b12x during CUDA graph capture: any Python-level exception in our
+        # dispatch corrupts the recording stream (cudaErrorStreamCaptureInvalidated)
+        # and the Triton fallback below cannot recover from it.  Capture happens
+        # only during warmup; steady-state decode is unaffected.
+        if (
+            is_b12x_mla_enabled(q.device)
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            try:
+                self._forward_sparse_mla_decode_b12x(
+                    q=q,
+                    swa_k_cache=self.swa_cache_layer.kv_cache,
+                    compressed_k_cache=compressed_k_cache,
+                    topk_indices=topk_indices,
+                    topk_lens=topk_lens,
+                    swa_metadata=swa_metadata,
+                    attn_metadata=attn_metadata,
+                    swa_only=swa_only,
+                    output=output,
+                )
+                return
+            except Exception as e:
+                logger.warning_once(
+                    f"b12x sparse MLA dispatch failed ({e!r}); "
+                    "falling back to Triton reference path. "
+                    "Set VLLM_B12X_MLA=0 to silence this warning."
+                )
 
         if is_sparse_mla_reference_attention_enabled(q.device):
             if swa_only:
