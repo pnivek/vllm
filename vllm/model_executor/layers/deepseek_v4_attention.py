@@ -72,6 +72,7 @@ from vllm.v1.attention.backends.mla.indexer import (
 from vllm.v1.attention.backends.mla.sparse_mla_env import (
     disable_triton_sparse_mla_cudagraphs_if_enabled,
     is_sparse_mla_attention_dump_enabled,
+    is_b12x_mla_enabled,
     is_triton_sparse_mla_enabled,
     sparse_mla_attention_dump_path,
     triton_sparse_mla_matmul_decode_enabled,
@@ -1115,6 +1116,308 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         if output.shape[1] > self.num_heads:
             output[:, self.num_heads :].zero_()
 
+    def _forward_sparse_mla_decode_b12x(
+        self,
+        *,
+        q: torch.Tensor,
+        swa_k_cache: torch.Tensor,
+        compressed_k_cache: torch.Tensor | None,
+        topk_indices: torch.Tensor | None,
+        topk_lens: torch.Tensor | None,
+        swa_metadata: "DeepseekSparseSWAMetadata",
+        attn_metadata: "FlashMLASparseMetadata | None",
+        swa_only: bool,
+        output: torch.Tensor,
+    ) -> None:
+        """Decode via b12x sparse_mla_decode_forward.
+
+        Replaces the Triton/FlashMLA path for SM12x decode.  Handles SWA-only
+        and compressed (C4A/C128A) cases by combining their gather indices.
+
+        Limitations (v1):
+          - Sink correction not yet wired through b12x; relies on DSV4-Flash's
+            sink being -inf padded (so contribution is zero).
+          - KV cache is per-call gather-converted (Option A from spec); fused
+            insert is a future optimization.
+        """
+        from b12x.integration.mla import (
+            B12XAttentionArena,
+            B12XAttentionArenaCaps,
+            B12XAttentionWorkspaceContract,
+            MLASparseDecodeMetadata,
+            sparse_mla_decode_forward,
+        )
+        from b12x.integration.vllm_kv_converter import (
+            convert_fp8ds_to_b12x_gathered,
+            gather_and_dequant_fp8ds,
+        )
+        from b12x.attention.mla.reference import (
+            _sparse_attention_reference_vectorized,
+        )
+
+        num_decodes = swa_metadata.num_decodes
+        num_decode_tokens = swa_metadata.num_decode_tokens
+        block_size = int(swa_metadata.block_size)
+        device = q.device
+
+        # ---- per-phase timing (env-gated; B12X_PROFILE_DISPATCH=1 to enable) ----
+        import os as _os
+        _profile = bool(int(_os.environ.get("B12X_PROFILE_DISPATCH", "0") or "0"))
+        if _profile:
+            import time
+            cls = type(self)
+            if not hasattr(cls, "_b12x_phase_times"):
+                cls._b12x_phase_times = {}
+                cls._b12x_phase_calls = 0
+            phase_t = {}
+            torch.cuda.synchronize(device)
+            t0 = time.perf_counter()
+            def _tick(name):
+                torch.cuda.synchronize(device)
+                t1 = time.perf_counter()
+                nonlocal t0
+                phase_t[name] = phase_t.get(name, 0.0) + (t1 - t0)
+                t0 = t1
+        else:
+            def _tick(name):
+                pass
+
+        # 1. Build the global slot id table (combined SWA + topk for compressed).
+        swa_indices_raw = swa_metadata.decode_swa_indices[:num_decode_tokens]
+        # vLLM hands us swa_indices as (N, 1, max_swa_len) with a dummy middle
+        # dim; b12x expects rank-2 (N, max_swa_len).
+        if swa_indices_raw.ndim == 3 and swa_indices_raw.shape[1] == 1:
+            swa_indices_raw = swa_indices_raw.squeeze(1)
+        swa_indices = swa_indices_raw.to(torch.int32).contiguous()
+        swa_lens_raw = swa_metadata.decode_swa_lens[:num_decode_tokens]
+        if swa_lens_raw.ndim == 2 and swa_lens_raw.shape[1] == 1:
+            swa_lens_raw = swa_lens_raw.squeeze(1)
+        swa_lens = swa_lens_raw.to(torch.int32).contiguous()
+        # ──────────────────────────────────────────────────────────────────
+        # Path selection: native cuTe (default, fast) vs host bypass (parity).
+        # Set B12X_MLA_FORCE_REFERENCE=1 to use the BF16 reference attention
+        # — useful for cross-check during bring-up but slower per-layer.
+        # ──────────────────────────────────────────────────────────────────
+        _force_reference = bool(int(_os.environ.get("B12X_MLA_FORCE_REFERENCE", "0") or "0"))
+        _tick("setup")
+
+        # 2. Gather KV into the right cache format for the chosen attention path.
+        # Both paths produce arange-based int32 page_table; we mask -1 by length.
+        if swa_only:
+            assert compressed_k_cache is None or compressed_k_cache.numel() == 0
+            arange_swa = torch.arange(swa_indices.shape[1], device=device, dtype=torch.int32)
+            if _force_reference:
+                k_nope, k_rope, new_page_table = gather_and_dequant_fp8ds(
+                    swa_k_cache, swa_indices, block_size=block_size,
+                )
+                packed_b12x_cache = None  # unused
+            else:
+                packed_b12x_cache, new_page_table = convert_fp8ds_to_b12x_gathered(
+                    swa_k_cache, swa_indices, block_size=block_size,
+                )
+                k_nope = k_rope = None  # unused
+            new_page_table = torch.where(
+                arange_swa.unsqueeze(0) < swa_lens.unsqueeze(1),
+                new_page_table, torch.full_like(new_page_table, -1),
+            )
+            active_lens = swa_lens
+        else:
+            if compressed_k_cache is None or topk_indices is None or topk_lens is None:
+                raise RuntimeError(
+                    "compressed b12x decode requires topk_indices, topk_lens, "
+                    "and compressed_k_cache"
+                )
+            topk_2d = topk_indices.view(num_decode_tokens, -1).to(torch.int32)
+            compressed_topk = topk_2d.shape[1]
+            max_swa_len = swa_indices.shape[1]
+            compressed_block_size = attn_metadata.block_size // self.compress_ratio
+
+            arange_topk = torch.arange(compressed_topk, device=device, dtype=torch.int32)
+            arange_swa = torch.arange(max_swa_len, device=device, dtype=torch.int32)
+            topk_lens_int = topk_lens.to(torch.int32)
+
+            if _force_reference:
+                comp_nope, comp_rope, comp_new_pt = gather_and_dequant_fp8ds(
+                    compressed_k_cache, topk_2d, block_size=compressed_block_size,
+                )
+                swa_nope, swa_rope, swa_new_pt = gather_and_dequant_fp8ds(
+                    swa_k_cache, swa_indices, block_size=block_size,
+                )
+                k_nope = torch.cat([comp_nope, swa_nope], dim=0)
+                k_rope = torch.cat([comp_rope, swa_rope], dim=0)
+                packed_b12x_cache = None
+                n_comp_rows = comp_nope.shape[0]
+            else:
+                comp_packed, comp_new_pt = convert_fp8ds_to_b12x_gathered(
+                    compressed_k_cache, topk_2d, block_size=compressed_block_size,
+                )
+                swa_packed, swa_new_pt = convert_fp8ds_to_b12x_gathered(
+                    swa_k_cache, swa_indices, block_size=block_size,
+                )
+                packed_b12x_cache = torch.cat([comp_packed, swa_packed], dim=0)
+                k_nope = k_rope = None
+                n_comp_rows = comp_packed.shape[0]
+            comp_pt_final = torch.where(
+                arange_topk.unsqueeze(0) < topk_lens_int.unsqueeze(1),
+                comp_new_pt, torch.full_like(comp_new_pt, -1),
+            )
+            swa_pt_final = torch.where(
+                arange_swa.unsqueeze(0) < swa_lens.unsqueeze(1),
+                swa_new_pt + n_comp_rows, torch.full_like(swa_new_pt, -1),
+            )
+            new_page_table = torch.cat([comp_pt_final, swa_pt_final], dim=1)
+            full_width = new_page_table.shape[1]
+            active_lens = torch.full(
+                (num_decode_tokens,), full_width,
+                dtype=torch.int32, device=device,
+            )
+
+        _tick("gather_dequant")
+        # Slice q from padded_heads -> num_heads (drop FlashMLA padding).
+        q_b12x = q.view(num_decode_tokens, q.shape[-2], q.shape[-1])
+        q_b12x = q_b12x[:, :self.num_heads, :].contiguous()
+
+        attn_sink = (
+            self.attn_sink[:self.num_heads]
+            if self.attn_sink is not None and self.attn_sink.numel() >= self.num_heads
+            else None
+        )
+        _tick("q_kv_prep")
+        if _force_reference:
+            # Bypass path: BF16 K/V, vectorised reference attention.
+            k_all = torch.cat([k_nope, k_rope], dim=1)  # (rows, 512)
+            v_all = k_all
+            output_b12x = _sparse_attention_reference_vectorized(
+                q_all=q_b12x,
+                k_all=k_all,
+                v_all=v_all,
+                page_table_1=new_page_table,
+                active_token_counts=active_lens,
+                sm_scale=float(self.scale),
+                attn_sink=attn_sink,
+            )
+        else:
+            # Native cuTe path: dispatch to sparse_mla_decode_forward with the
+            # packed b12x cache. v=512 (rope folded into V) and attn_sink are
+            # both supported natively as of b12x d4357b7 / e6a0a5d.
+            workspace = self._b12x_workspace_for(
+                max_total_q=num_decode_tokens,
+                max_batch=num_decode_tokens,
+                topk=int(new_page_table.shape[-1]),
+                device=device,
+                max_kv_rows=int(packed_b12x_cache.shape[0]),
+            )
+            metadata = MLASparseDecodeMetadata(
+                page_table_1=new_page_table,
+                cache_seqlens_int32=active_lens,
+                nsa_cache_seqlens_int32=active_lens,
+                max_seq_len_k=int(new_page_table.shape[-1]),
+            )
+            output_b12x = sparse_mla_decode_forward(
+                q_all=q_b12x,
+                kv_cache=packed_b12x_cache,
+                metadata=metadata,
+                workspace=workspace,
+                sm_scale=float(self.scale),
+                v_head_dim=int(self.kv_lora_rank),
+                attn_sink=attn_sink,
+            )
+        _tick("attention")
+
+        # 6. Write back into the FlashMLA-padded output buffer.
+        logger.info_once("b12x sparse MLA decode dispatch invoked successfully (b12x_dispatch_invoked)")
+        if output_b12x.shape != (num_decode_tokens, self.num_heads, self.kv_lora_rank):
+            raise RuntimeError(
+                f"b12x returned unexpected shape {tuple(output_b12x.shape)}; "
+                f"expected ({num_decode_tokens}, {self.num_heads}, {self.kv_lora_rank})"
+            )
+        output[:num_decode_tokens, :self.num_heads, :self.kv_lora_rank].copy_(
+            output_b12x
+        )
+        if output.shape[1] > self.num_heads:
+            output[:num_decode_tokens, self.num_heads:].zero_()
+        _tick("write_out")
+        if _profile:
+            cls = type(self)
+            for k, v in phase_t.items():
+                cls._b12x_phase_times[k] = cls._b12x_phase_times.get(k, 0.0) + v
+            cls._b12x_phase_calls += 1
+            if cls._b12x_phase_calls % 200 == 0:
+                total = sum(cls._b12x_phase_times.values()) or 1.0
+                summary = " | ".join(
+                    f"{k}={cls._b12x_phase_times[k]*1000/cls._b12x_phase_calls:.2f}ms({cls._b12x_phase_times[k]/total*100:.0f}%)"
+                    for k in ["setup", "gather_dequant", "q_kv_prep", "attention", "write_out"]
+                    if k in cls._b12x_phase_times
+                )
+                logger.warning(f"[B12X_PROFILE n={cls._b12x_phase_calls}] {summary}")
+
+    def _b12x_workspace_for(
+        self,
+        max_total_q: int,
+        max_batch: int,
+        topk: int,
+        device: torch.device,
+        max_kv_rows: int,
+    ):
+        """Lazy-cached b12x workspace keyed on shape signature."""
+        from b12x.integration.mla import (
+            B12XAttentionArena,
+            B12XAttentionArenaCaps,
+            B12XAttentionWorkspaceContract,
+        )
+
+        cache = getattr(self, "_b12x_workspaces", None)
+        if cache is None:
+            cache = {}
+            self._b12x_workspaces = cache
+        # round capacity upwards so we don't churn on minor batch deltas.
+        # IMPORTANT: max_batch must be >= max_total_q because vLLM passes
+        # cache_seqlens batch == num_decode_tokens (one entry per decode token,
+        # not per request) — with MTP, num_decode_tokens > num_decodes.
+        bucket_q = max(8, 1 << (max_total_q - 1).bit_length()) if max_total_q else 8
+        max_batch = max(max_batch, bucket_q)
+        bucket_kv = max(64, 1 << (max_kv_rows - 1).bit_length()) if max_kv_rows else 64
+        bucket_topk = max(64, 1 << (topk - 1).bit_length()) if topk else 64
+        key = (bucket_q, max_batch, bucket_topk, bucket_kv,
+               int(self.num_heads), int(self.head_dim), int(self.kv_lora_rank),
+               int(getattr(self.swa_cache_layer.kv_cache, "shape", [0, 0])[0]))
+        ws = cache.get(key)
+        if ws is not None:
+            return ws
+
+        caps = B12XAttentionArenaCaps(
+            device=device,
+            dtype=torch.bfloat16,
+            kv_dtype=torch.uint8,
+            num_q_heads=int(self.num_heads),
+            indexer_num_q_heads=int(self.num_heads),
+            head_dim=int(self.head_dim),
+            max_v_head_dim=int(self.kv_lora_rank),
+            topk=bucket_topk,
+            max_page_table_width=bucket_topk,
+            extend_max_total_q=bucket_q,
+            extend_max_batch=max_batch,
+            extend_max_kv_rows=bucket_kv,
+            paged_max_q_rows=bucket_q,
+            paged_max_batch=max_batch,
+            page_size=int(self.swa_cache_layer.kv_cache.shape[1])
+            if self.swa_cache_layer.kv_cache.ndim > 1 else 256,
+            padded_heads=int(self.num_heads),
+        )
+        arena = B12XAttentionArena.allocate(caps)
+        ws = arena.make_workspace(B12XAttentionWorkspaceContract(
+            mode="decode",
+            max_total_q=bucket_q,
+            max_batch=max_batch,
+            max_paged_q_rows=bucket_q,
+            max_kv_rows=bucket_kv,
+            v_head_dim=int(self.kv_lora_rank),
+            indexer_num_q_heads=int(self.num_heads),
+            max_page_table_width=bucket_topk,
+        ))
+        cache[key] = ws
+        return ws
+
     def _forward_sparse_mla_prefill_triton(
         self,
         q: torch.Tensor,
@@ -1321,6 +1624,36 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             attn_metadata=attn_metadata,
             fields=decode_fields,
         )
+
+        # Skip b12x during CUDA graph capture: any Python-level exception in our
+        # dispatch corrupts the recording stream (cudaErrorStreamCaptureInvalidated)
+        # and the Triton fallback below cannot recover from it.  Capture happens
+        # only during warmup; steady-state decode is unaffected.
+        if (
+            is_b12x_mla_enabled(q.device)
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            try:
+                self._forward_sparse_mla_decode_b12x(
+                    q=q,
+                    swa_k_cache=self.swa_cache_layer.kv_cache,
+                    compressed_k_cache=compressed_k_cache,
+                    topk_indices=topk_indices,
+                    topk_lens=topk_lens,
+                    swa_metadata=swa_metadata,
+                    attn_metadata=attn_metadata,
+                    swa_only=swa_only,
+                    output=output,
+                )
+                return
+            except Exception as e:
+                import traceback
+                logger.warning_once(
+                    f"b12x sparse MLA dispatch failed ({e!r}); "
+                    "falling back to Triton sparse MLA path. "
+                    "Set VLLM_B12X_MLA=0 to silence this warning.\n"
+                    + traceback.format_exc()
+                )
 
         if is_triton_sparse_mla_enabled(q.device):
             if swa_only:
