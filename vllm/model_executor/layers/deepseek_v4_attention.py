@@ -1130,6 +1130,11 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             _sparse_attention_reference_vectorized,
         )
 
+        num_decodes = swa_metadata.num_decodes
+        num_decode_tokens = swa_metadata.num_decode_tokens
+        block_size = int(swa_metadata.block_size)
+        device = q.device
+
         # ---- per-phase timing (env-gated; B12X_PROFILE_DISPATCH=1 to enable) ----
         import os as _os
         _profile = bool(int(_os.environ.get("B12X_PROFILE_DISPATCH", "0") or "0"))
@@ -1151,11 +1156,6 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         else:
             def _tick(name):
                 pass
-
-        num_decodes = swa_metadata.num_decodes
-        num_decode_tokens = swa_metadata.num_decode_tokens
-        block_size = int(swa_metadata.block_size)
-        device = q.device
 
         # 1. Build the global slot id table (combined SWA + topk for compressed).
         swa_indices_raw = swa_metadata.decode_swa_indices[:num_decode_tokens]
