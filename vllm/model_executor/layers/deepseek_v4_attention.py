@@ -1124,6 +1124,10 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         )
         from b12x.integration.vllm_kv_converter import (
             convert_fp8ds_to_b12x_gathered,
+            gather_and_dequant_fp8ds,
+        )
+        from b12x.attention.mla.reference import (
+            _sparse_attention_reference_vectorized,
         )
 
         num_decodes = swa_metadata.num_decodes
@@ -1142,18 +1146,14 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         if swa_lens_raw.ndim == 2 and swa_lens_raw.shape[1] == 1:
             swa_lens_raw = swa_lens_raw.squeeze(1)
         swa_lens = swa_lens_raw.to(torch.int32).contiguous()
+        # FAST PATH: skip b12x's pack/unpack round-trip. Gather + dequant to BF16
+        # directly, then call the vectorised attention kernel with the BF16 K/V.
         if swa_only:
             assert compressed_k_cache is None or compressed_k_cache.numel() == 0
-            # Mask invalid swa entries with -1 so b12x skips them
             arange_swa = torch.arange(swa_indices.shape[1], device=device, dtype=torch.int32)
-            swa_pt_masked = torch.where(
-                arange_swa.unsqueeze(0) < swa_lens.unsqueeze(1),
-                swa_indices, torch.full_like(swa_indices, -1),
+            k_nope, k_rope, new_page_table = gather_and_dequant_fp8ds(
+                swa_k_cache, swa_indices, block_size=block_size,
             )
-            b12x_cache, new_page_table = convert_fp8ds_to_b12x_gathered(
-                swa_k_cache, swa_pt_masked, block_size=block_size,
-            )
-            # Re-mask: convert returns arange-based pt that doesn't preserve -1
             new_page_table = torch.where(
                 arange_swa.unsqueeze(0) < swa_lens.unsqueeze(1),
                 new_page_table, torch.full_like(new_page_table, -1),
@@ -1165,7 +1165,6 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     "compressed b12x decode requires topk_indices, topk_lens, "
                     "and compressed_k_cache"
                 )
-            # topk_indices is (N, 1, max_topk) — squeeze the dummy dim.
             topk_2d = topk_indices.view(num_decode_tokens, -1).to(torch.int32)
             compressed_topk = topk_2d.shape[1]
             max_swa_len = swa_indices.shape[1]
@@ -1174,23 +1173,16 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             arange_topk = torch.arange(compressed_topk, device=device, dtype=torch.int32)
             arange_swa = torch.arange(max_swa_len, device=device, dtype=torch.int32)
             topk_lens_int = topk_lens.to(torch.int32)
-            comp_pt_masked = torch.where(
-                arange_topk.unsqueeze(0) < topk_lens_int.unsqueeze(1),
-                topk_2d, torch.full_like(topk_2d, -1),
-            )
-            swa_pt_masked = torch.where(
-                arange_swa.unsqueeze(0) < swa_lens.unsqueeze(1),
-                swa_indices, torch.full_like(swa_indices, -1),
-            )
 
-            comp_b12x, comp_new_pt = convert_fp8ds_to_b12x_gathered(
-                compressed_k_cache, comp_pt_masked, block_size=compressed_block_size,
+            comp_nope, comp_rope, comp_new_pt = gather_and_dequant_fp8ds(
+                compressed_k_cache, topk_2d, block_size=compressed_block_size,
             )
-            swa_b12x, swa_new_pt = convert_fp8ds_to_b12x_gathered(
-                swa_k_cache, swa_pt_masked, block_size=block_size,
+            swa_nope, swa_rope, swa_new_pt = gather_and_dequant_fp8ds(
+                swa_k_cache, swa_indices, block_size=block_size,
             )
-            n_comp_rows = comp_b12x.shape[0]
-            # Re-mask invalid slots; offset SWA pt into the combined cache range
+            k_nope = torch.cat([comp_nope, swa_nope], dim=0)
+            k_rope = torch.cat([comp_rope, swa_rope], dim=0)
+            n_comp_rows = comp_nope.shape[0]
             comp_pt_final = torch.where(
                 arange_topk.unsqueeze(0) < topk_lens_int.unsqueeze(1),
                 comp_new_pt, torch.full_like(comp_new_pt, -1),
@@ -1199,47 +1191,34 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 arange_swa.unsqueeze(0) < swa_lens.unsqueeze(1),
                 swa_new_pt + n_comp_rows, torch.full_like(swa_new_pt, -1),
             )
-            b12x_cache = torch.cat([comp_b12x, swa_b12x], dim=0)
             new_page_table = torch.cat([comp_pt_final, swa_pt_final], dim=1)
-            # active_lens covers the FULL padded width because valid entries are
-            # interleaved with -1 padding (compressed chunk may not be full).
-            # The b12x kernel/reference filters -1 from any range.
             full_width = new_page_table.shape[1]
             active_lens = torch.full(
                 (num_decode_tokens,), full_width,
                 dtype=torch.int32, device=device,
             )
 
-        topk = int(new_page_table.shape[1])
-
-        # 3. Allocate (or reuse) b12x workspace.
-        ws = self._b12x_workspace_for(num_decode_tokens, num_decodes, topk,
-                                      device, b12x_cache.shape[0])
-
-        # 4. Slice q from padded_heads -> num_heads (drop FlashMLA padding).
+        # Slice q from padded_heads -> num_heads (drop FlashMLA padding).
         q_b12x = q.view(num_decode_tokens, q.shape[-2], q.shape[-1])
         q_b12x = q_b12x[:, :self.num_heads, :].contiguous()
 
-        # 5. Build metadata + run b12x decode.
-        cache_seqlens_int32 = active_lens.clone()
-        nsa_cache_seqlens_int32 = active_lens.clone()
-        max_seq_len_k = int(active_lens.max().item()) if active_lens.numel() else 0
-        metadata = MLASparseDecodeMetadata(
-            page_table_1=new_page_table,
-            cache_seqlens_int32=cache_seqlens_int32,
-            nsa_cache_seqlens_int32=nsa_cache_seqlens_int32,
-            max_seq_len_k=max_seq_len_k,
-        )
-        output_b12x = sparse_mla_decode_forward(
-            q_all=q_b12x,
-            kv_cache=b12x_cache,
-            metadata=metadata,
-            workspace=ws,
-            sm_scale=float(self.scale),
-            v_head_dim=int(self.kv_lora_rank),
-            attn_sink=self.attn_sink[:self.num_heads]
+        # Build k_all = concat(k_nope, k_rope); V = K (DSV4 MLA-absorbed convention)
+        k_all = torch.cat([k_nope, k_rope], dim=1)  # (rows, 512)
+        v_all = k_all  # V is full K (kv_lora_rank == head_dim for DSV4)
+
+        attn_sink = (
+            self.attn_sink[:self.num_heads]
             if self.attn_sink is not None and self.attn_sink.numel() >= self.num_heads
-            else None,
+            else None
+        )
+        output_b12x = _sparse_attention_reference_vectorized(
+            q_all=q_b12x,
+            k_all=k_all,
+            v_all=v_all,
+            page_table_1=new_page_table,
+            active_token_counts=active_lens,
+            sm_scale=float(self.scale),
+            attn_sink=attn_sink,
         )
 
         # 6. Write back into the FlashMLA-padded output buffer.
