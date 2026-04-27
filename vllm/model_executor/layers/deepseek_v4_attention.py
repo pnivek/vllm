@@ -1241,15 +1241,15 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
 
         # 6. Write back into the FlashMLA-padded output buffer.
         logger.info_once("b12x sparse MLA decode dispatch invoked successfully (b12x_dispatch_invoked)")
-        if output_b12x.shape != (num_decode_tokens, self.num_heads, self.kv_lora_rank):
-            raise RuntimeError(
-                f"b12x returned unexpected shape: got {tuple(output_b12x.shape)}, "
-                f"expected ({num_decode_tokens}, {self.num_heads}, {self.kv_lora_rank}); "
-                f"output buffer shape is {tuple(output.shape)}, kv_lora_rank={self.kv_lora_rank}"
-            )
-        output[:num_decode_tokens, :self.num_heads, :self.kv_lora_rank].copy_(
-            output_b12x
-        )
+        b12x_v_dim = output_b12x.shape[-1]
+        out_v_dim = self.kv_lora_rank  # vLLM's expected V dim (may exceed b12x's)
+        # Zero-pad if b12x's reference path returned (N, H, nope_logical_dim) and
+        # vLLM expects a wider v dim (e.g., DSV4-Flash kv_lora_rank=512 vs our
+        # nope_logical_dim=448). The extra dims correspond to the zero-padded
+        # NoPE storage region, so zeros are arithmetically correct.
+        output[:num_decode_tokens, :self.num_heads, :b12x_v_dim].copy_(output_b12x)
+        if b12x_v_dim < out_v_dim:
+            output[:num_decode_tokens, :self.num_heads, b12x_v_dim:out_v_dim].zero_()
         if output.shape[1] > self.num_heads:
             output[:num_decode_tokens, self.num_heads:].zero_()
 
