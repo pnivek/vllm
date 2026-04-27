@@ -1144,10 +1144,21 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         swa_lens = swa_lens_raw.to(torch.int32).contiguous()
         if swa_only:
             assert compressed_k_cache is None or compressed_k_cache.numel() == 0
-            page_table_full = swa_indices  # (N, max_swa_len) int32
+            # Mask invalid swa entries with -1 so b12x skips them
+            arange_swa = torch.arange(swa_indices.shape[1], device=device, dtype=torch.int32)
+            swa_pt_masked = torch.where(
+                arange_swa.unsqueeze(0) < swa_lens.unsqueeze(1),
+                swa_indices, torch.full_like(swa_indices, -1),
+            )
+            b12x_cache, new_page_table = convert_fp8ds_to_b12x_gathered(
+                swa_k_cache, swa_pt_masked, block_size=block_size,
+            )
+            # Re-mask: convert returns arange-based pt that doesn't preserve -1
+            new_page_table = torch.where(
+                arange_swa.unsqueeze(0) < swa_lens.unsqueeze(1),
+                new_page_table, torch.full_like(new_page_table, -1),
+            )
             active_lens = swa_lens
-            # gather only from swa cache
-            kv_for_convert = swa_k_cache
         else:
             if compressed_k_cache is None or topk_indices is None or topk_lens is None:
                 raise RuntimeError(
@@ -1156,21 +1167,42 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 )
             # topk_indices is (N, 1, max_topk) — squeeze the dummy dim.
             topk_2d = topk_indices.view(num_decode_tokens, -1).to(torch.int32)
-            page_table_full = torch.cat([topk_2d, swa_indices], dim=1)
-            active_lens = (topk_lens.to(torch.int32) +
-                           swa_lens.to(torch.int32))
-            # NOTE: combining two backing caches into one b12x cache requires
-            # us to materialise their gather sources separately and stitch the
-            # indices.  For v1 we only support swa_only; compressed comes next.
-            raise NotImplementedError(
-                "b12x compressed (C4A/C128A) dispatch not yet implemented; "
-                "set VLLM_B12X_MLA=0 or rely on the Triton fallback for now"
+            compressed_topk = topk_2d.shape[1]
+            max_swa_len = swa_indices.shape[1]
+            compressed_block_size = attn_metadata.block_size // self.compress_ratio
+
+            arange_topk = torch.arange(compressed_topk, device=device, dtype=torch.int32)
+            arange_swa = torch.arange(max_swa_len, device=device, dtype=torch.int32)
+            topk_lens_int = topk_lens.to(torch.int32)
+            comp_pt_masked = torch.where(
+                arange_topk.unsqueeze(0) < topk_lens_int.unsqueeze(1),
+                topk_2d, torch.full_like(topk_2d, -1),
+            )
+            swa_pt_masked = torch.where(
+                arange_swa.unsqueeze(0) < swa_lens.unsqueeze(1),
+                swa_indices, torch.full_like(swa_indices, -1),
             )
 
-        # 2. Convert vLLM fp8_ds_mla cache rows (gather-first) -> b12x packed.
-        b12x_cache, new_page_table = convert_fp8ds_to_b12x_gathered(
-            kv_for_convert, page_table_full, block_size=block_size,
-        )
+            comp_b12x, comp_new_pt = convert_fp8ds_to_b12x_gathered(
+                compressed_k_cache, comp_pt_masked, block_size=compressed_block_size,
+            )
+            swa_b12x, swa_new_pt = convert_fp8ds_to_b12x_gathered(
+                swa_k_cache, swa_pt_masked, block_size=block_size,
+            )
+            n_comp_rows = comp_b12x.shape[0]
+            # Re-mask invalid slots; offset SWA pt into the combined cache range
+            comp_pt_final = torch.where(
+                arange_topk.unsqueeze(0) < topk_lens_int.unsqueeze(1),
+                comp_new_pt, torch.full_like(comp_new_pt, -1),
+            )
+            swa_pt_final = torch.where(
+                arange_swa.unsqueeze(0) < swa_lens.unsqueeze(1),
+                swa_new_pt + n_comp_rows, torch.full_like(swa_new_pt, -1),
+            )
+            b12x_cache = torch.cat([comp_b12x, swa_b12x], dim=0)
+            new_page_table = torch.cat([comp_pt_final, swa_pt_final], dim=1)
+            active_lens = topk_lens_int + swa_lens
+
         topk = int(new_page_table.shape[1])
 
         # 3. Allocate (or reuse) b12x workspace.
