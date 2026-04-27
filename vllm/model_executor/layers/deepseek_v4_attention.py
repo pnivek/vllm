@@ -1130,6 +1130,28 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             _sparse_attention_reference_vectorized,
         )
 
+        # ---- per-phase timing (env-gated; B12X_PROFILE_DISPATCH=1 to enable) ----
+        import os as _os
+        _profile = bool(int(_os.environ.get("B12X_PROFILE_DISPATCH", "0") or "0"))
+        if _profile:
+            import time
+            cls = type(self)
+            if not hasattr(cls, "_b12x_phase_times"):
+                cls._b12x_phase_times = {}
+                cls._b12x_phase_calls = 0
+            phase_t = {}
+            torch.cuda.synchronize(device)
+            t0 = time.perf_counter()
+            def _tick(name):
+                torch.cuda.synchronize(device)
+                t1 = time.perf_counter()
+                nonlocal t0
+                phase_t[name] = phase_t.get(name, 0.0) + (t1 - t0)
+                t0 = t1
+        else:
+            def _tick(name):
+                pass
+
         num_decodes = swa_metadata.num_decodes
         num_decode_tokens = swa_metadata.num_decode_tokens
         block_size = int(swa_metadata.block_size)
@@ -1148,6 +1170,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         swa_lens = swa_lens_raw.to(torch.int32).contiguous()
         # FAST PATH: skip b12x's pack/unpack round-trip. Gather + dequant to BF16
         # directly, then call the vectorised attention kernel with the BF16 K/V.
+        _tick("setup")
         if swa_only:
             assert compressed_k_cache is None or compressed_k_cache.numel() == 0
             arange_swa = torch.arange(swa_indices.shape[1], device=device, dtype=torch.int32)
@@ -1198,6 +1221,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 dtype=torch.int32, device=device,
             )
 
+        _tick("gather_dequant")
         # Slice q from padded_heads -> num_heads (drop FlashMLA padding).
         q_b12x = q.view(num_decode_tokens, q.shape[-2], q.shape[-1])
         q_b12x = q_b12x[:, :self.num_heads, :].contiguous()
@@ -1211,6 +1235,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             if self.attn_sink is not None and self.attn_sink.numel() >= self.num_heads
             else None
         )
+        _tick("q_kv_prep")
         output_b12x = _sparse_attention_reference_vectorized(
             q_all=q_b12x,
             k_all=k_all,
@@ -1220,6 +1245,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             sm_scale=float(self.scale),
             attn_sink=attn_sink,
         )
+        _tick("attention")
 
         # 6. Write back into the FlashMLA-padded output buffer.
         logger.info_once("b12x sparse MLA decode dispatch invoked successfully (b12x_dispatch_invoked)")
@@ -1233,6 +1259,20 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         )
         if output.shape[1] > self.num_heads:
             output[:num_decode_tokens, self.num_heads:].zero_()
+        _tick("write_out")
+        if _profile:
+            cls = type(self)
+            for k, v in phase_t.items():
+                cls._b12x_phase_times[k] = cls._b12x_phase_times.get(k, 0.0) + v
+            cls._b12x_phase_calls += 1
+            if cls._b12x_phase_calls % 200 == 0:
+                total = sum(cls._b12x_phase_times.values()) or 1.0
+                summary = " | ".join(
+                    f"{k}={cls._b12x_phase_times[k]*1000/cls._b12x_phase_calls:.2f}ms({cls._b12x_phase_times[k]/total*100:.0f}%)"
+                    for k in ["setup", "gather_dequant", "q_kv_prep", "attention", "write_out"]
+                    if k in cls._b12x_phase_times
+                )
+                logger.warning(f"[B12X_PROFILE n={cls._b12x_phase_calls}] {summary}")
 
     def _b12x_workspace_for(
         self,
