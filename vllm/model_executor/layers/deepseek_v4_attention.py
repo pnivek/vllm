@@ -1266,8 +1266,12 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         if cache is None:
             cache = {}
             self._b12x_workspaces = cache
-        # round capacity upwards so we don't churn on minor batch deltas
+        # round capacity upwards so we don't churn on minor batch deltas.
+        # IMPORTANT: max_batch must be >= max_total_q because vLLM passes
+        # cache_seqlens batch == num_decode_tokens (one entry per decode token,
+        # not per request) — with MTP, num_decode_tokens > num_decodes.
         bucket_q = max(8, 1 << (max_total_q - 1).bit_length()) if max_total_q else 8
+        max_batch = max(max_batch, bucket_q)
         bucket_kv = max(64, 1 << (max_kv_rows - 1).bit_length()) if max_kv_rows else 64
         bucket_topk = max(64, 1 << (topk - 1).bit_length()) if topk else 64
         key = (bucket_q, max_batch, bucket_topk, bucket_kv,
@@ -1537,10 +1541,12 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 )
                 return
             except Exception as e:
+                import traceback
                 logger.warning_once(
                     f"b12x sparse MLA dispatch failed ({e!r}); "
                     "falling back to Triton reference path. "
-                    "Set VLLM_B12X_MLA=0 to silence this warning."
+                    "Set VLLM_B12X_MLA=0 to silence this warning.\n"
+                    + traceback.format_exc()
                 )
 
         if is_sparse_mla_reference_attention_enabled(q.device):
