@@ -1241,6 +1241,12 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
 
         # 6. Write back into the FlashMLA-padded output buffer.
         logger.info_once("b12x sparse MLA decode dispatch invoked successfully (b12x_dispatch_invoked)")
+        if output_b12x.shape != (num_decode_tokens, self.num_heads, self.kv_lora_rank):
+            raise RuntimeError(
+                f"b12x returned unexpected shape: got {tuple(output_b12x.shape)}, "
+                f"expected ({num_decode_tokens}, {self.num_heads}, {self.kv_lora_rank}); "
+                f"output buffer shape is {tuple(output.shape)}, kv_lora_rank={self.kv_lora_rank}"
+            )
         output[:num_decode_tokens, :self.num_heads, :self.kv_lora_rank].copy_(
             output_b12x
         )
