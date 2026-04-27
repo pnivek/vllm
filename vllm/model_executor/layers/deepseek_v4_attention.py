@@ -1201,7 +1201,14 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             )
             b12x_cache = torch.cat([comp_b12x, swa_b12x], dim=0)
             new_page_table = torch.cat([comp_pt_final, swa_pt_final], dim=1)
-            active_lens = topk_lens_int + swa_lens
+            # active_lens covers the FULL padded width because valid entries are
+            # interleaved with -1 padding (compressed chunk may not be full).
+            # The b12x kernel/reference filters -1 from any range.
+            full_width = new_page_table.shape[1]
+            active_lens = torch.full(
+                (num_decode_tokens,), full_width,
+                dtype=torch.int32, device=device,
+            )
 
         topk = int(new_page_table.shape[1])
 
