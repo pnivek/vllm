@@ -1237,6 +1237,9 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             workspace=ws,
             sm_scale=float(self.scale),
             v_head_dim=int(self.kv_lora_rank),
+            attn_sink=self.attn_sink[:self.num_heads]
+            if self.attn_sink is not None and self.attn_sink.numel() >= self.num_heads
+            else None,
         )
 
         # 6. Write back into the FlashMLA-padded output buffer.
