@@ -1405,16 +1405,23 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             padded_heads=int(self.num_heads),
         )
         arena = B12XAttentionArena.allocate(caps)
-        ws = arena.make_workspace(B12XAttentionWorkspaceContract(
-            mode="decode",
-            max_total_q=bucket_q,
-            max_batch=max_batch,
-            max_paged_q_rows=bucket_q,
-            max_kv_rows=bucket_kv,
-            v_head_dim=int(self.kv_lora_rank),
-            indexer_num_q_heads=int(self.num_heads),
-            max_page_table_width=bucket_topk,
-        ))
+        ws = arena.make_workspace(
+            B12XAttentionWorkspaceContract(
+                mode="decode",
+                max_total_q=bucket_q,
+                max_batch=max_batch,
+                max_paged_q_rows=bucket_q,
+                max_kv_rows=bucket_kv,
+                v_head_dim=int(self.kv_lora_rank),
+                indexer_num_q_heads=int(self.num_heads),
+                max_page_table_width=bucket_topk,
+            ),
+            # Stable phantom-tensor identities for the kernel-launcher cache key
+            # so capture and replay reuse the same compiled launch. Combined with
+            # fixed_capacity=True (always set by make_workspace) this keeps the
+            # workspace graph-safe.
+            use_cuda_graph=True,
+        )
         cache[key] = ws
         return ws
 
@@ -1625,35 +1632,29 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             fields=decode_fields,
         )
 
-        # Skip b12x during CUDA graph capture: any Python-level exception in our
-        # dispatch corrupts the recording stream (cudaErrorStreamCaptureInvalidated)
-        # and the Triton fallback below cannot recover from it.  Capture happens
-        # only during warmup; steady-state decode is unaffected.
-        if (
-            is_b12x_mla_enabled(q.device)
-            and not torch.cuda.is_current_stream_capturing()
-        ):
-            try:
-                self._forward_sparse_mla_decode_b12x(
-                    q=q,
-                    swa_k_cache=self.swa_cache_layer.kv_cache,
-                    compressed_k_cache=compressed_k_cache,
-                    topk_indices=topk_indices,
-                    topk_lens=topk_lens,
-                    swa_metadata=swa_metadata,
-                    attn_metadata=attn_metadata,
-                    swa_only=swa_only,
-                    output=output,
-                )
-                return
-            except Exception as e:
-                import traceback
-                logger.warning_once(
-                    f"b12x sparse MLA dispatch failed ({e!r}); "
-                    "falling back to Triton sparse MLA path. "
-                    "Set VLLM_B12X_MLA=0 to silence this warning.\n"
-                    + traceback.format_exc()
-                )
+        # b12x dispatch fires both eagerly (during vLLM dummy_run warmup) and
+        # during CUDA graph capture/replay. The b12x workspace is allocated with
+        # fixed_capacity=True so its tensors have stable addresses across calls,
+        # and the cuTe kernel JIT-compile is populated by the warmup pass before
+        # capture begins — so the capture stream sees only kernel launches with
+        # stable inputs.
+        # If the dispatch ever raises during capture, the recording stream
+        # cannot be recovered; we deliberately do NOT try/except here so the
+        # error surfaces immediately rather than silently corrupting the graph.
+        # Set VLLM_B12X_MLA=0 to disable this dispatch entirely.
+        if is_b12x_mla_enabled(q.device):
+            self._forward_sparse_mla_decode_b12x(
+                q=q,
+                swa_k_cache=self.swa_cache_layer.kv_cache,
+                compressed_k_cache=compressed_k_cache,
+                topk_indices=topk_indices,
+                topk_lens=topk_lens,
+                swa_metadata=swa_metadata,
+                attn_metadata=attn_metadata,
+                swa_only=swa_only,
+                output=output,
+            )
+            return
 
         if is_triton_sparse_mla_enabled(q.device):
             if swa_only:
